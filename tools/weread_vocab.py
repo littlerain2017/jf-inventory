@@ -326,15 +326,15 @@ def markdown_to_notion_blocks(md: str) -> list[dict]:
     return blocks
 
 
-def send_to_notion(title: str, md_content: str) -> str:
-    """将 markdown 内容创建为 Notion 页面，返回页面 URL。"""
+def send_to_notion(chapter_title: str, md_content: str) -> str:
+    """将生词内容追加到已有 Notion 页面，章节名作为 h2 小标题，返回页面 URL。"""
     try:
         from notion_client import Client
     except ImportError:
         die("请先安装 notion-client：pip install -r requirements.txt")
 
     api_key = os.getenv("NOTION_API_KEY", "").strip()
-    parent_id = os.getenv("NOTION_PAGE_ID", "").strip()
+    page_id = os.getenv("NOTION_PAGE_ID", "").strip()
 
     if not api_key:
         die(
@@ -342,32 +342,33 @@ def send_to_notion(title: str, md_content: str) -> str:
             "请到 https://www.notion.so/my-integrations 创建 Integration，\n"
             "将生成的 secret_xxx 写入 tools/.env：\n"
             "  NOTION_API_KEY=secret_xxx\n"
-            "并在 Notion 目标页面右上角 ··· → Connections 中添加该 Integration。"
+            "并在目标页面右上角 ··· → Connections 中添加该 Integration。"
         )
-    if not parent_id:
+    if not page_id:
         die(
             "未设置 NOTION_PAGE_ID。\n"
-            "打开 Notion 目标页面，URL 末尾的 32 位字符串即为页面 ID，\n"
-            "写入 tools/.env：\n"
-            "  NOTION_PAGE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            "从 Notion 页面 URL 复制 32 位 ID，写入 tools/.env：\n"
+            "  NOTION_PAGE_ID=364d2f95ca0980a89e21c4a415a8894d"
         )
 
     notion = Client(auth=api_key)
-    blocks = markdown_to_notion_blocks(md_content)
 
-    # Notion API 单次最多 100 个 block
-    first_batch, rest = blocks[:100], blocks[100:]
-    page = notion.pages.create(
-        parent={"page_id": parent_id},
-        properties={"title": {"title": [{"type": "text", "text": {"content": title}}]}},
-        children=first_batch,
-    )
-    page_id = page["id"]
+    # 把 Claude 输出的 markdown 转为 Notion blocks，跳过首行 h1（书名已是页面标题）
+    raw_blocks = markdown_to_notion_blocks(md_content)
+    content_blocks = raw_blocks[1:] if raw_blocks and raw_blocks[0]["type"] == "heading_1" else raw_blocks
 
-    for start in range(0, len(rest), 100):
-        notion.blocks.children.append(page_id, children=rest[start:start + 100])
+    # 章节名作为 h2 小标题，前加分隔线
+    blocks = [
+        {"object": "block", "type": "divider", "divider": {}},
+        _blk("heading_2", _parse_inline(chapter_title)),
+        *content_blocks,
+    ]
 
-    return page.get("url") or f"https://notion.so/{page_id.replace('-', '')}"
+    # Notion API 单次最多 100 个 block，分批追加
+    for start in range(0, len(blocks), 100):
+        notion.blocks.children.append(page_id, children=blocks[start:start + 100])
+
+    return f"https://www.notion.so/{page_id.replace('-', '')}"
 
 
 # ── 列表交互 ──────────────────────────────────────────────────────────────────
@@ -575,10 +576,9 @@ def main():
     print(f"\n生词表已保存至：{output_path}")
 
     if args.notion:
-        notion_title = f"《{book_title}》{chapter_title} 生词表"
-        print(f"\n正在发送到 Notion：{notion_title} ...")
-        url = send_to_notion(notion_title, result)
-        print(f"已创建 Notion 页面：{url}")
+        print(f"\n正在追加到 Notion 页面，章节标题：{chapter_title} ...")
+        url = send_to_notion(chapter_title, result)
+        print(f"已追加到 Notion 页面：{url}")
 
     print("\n" + "=" * 55)
     print(result)
