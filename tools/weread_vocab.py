@@ -273,11 +273,74 @@ def is_english_book(book: dict) -> bool:
     return en_chars > len(title) * 0.5 if title else False
 
 
+def find_book(books: list[dict], query: str) -> Optional[dict]:
+    """按书名关键词查找书籍（不区分大小写）。"""
+    q = query.lower()
+    # 优先完整匹配
+    for b in books:
+        title = b.get("bookInfo", {}).get("title", "").lower()
+        if q == title:
+            return b
+    # 再做包含匹配
+    matches = [b for b in books if q in b.get("bookInfo", {}).get("title", "").lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        titles = [b.get("bookInfo", {}).get("title", "") for b in matches]
+        print(f"找到多本匹配书籍：{titles}")
+        print("请使用更精确的书名。")
+        sys.exit(1)
+    return None
+
+
+def find_chapter(chapters: list[dict], query: str) -> Optional[dict]:
+    """按章节编号（1-indexed）或标题关键词查找章节。"""
+    # 尝试作为数字索引处理
+    try:
+        idx = int(query) - 1
+        if 0 <= idx < len(chapters):
+            return chapters[idx]
+        die(f"章节编号 {query} 超出范围（共 {len(chapters)} 章）")
+    except ValueError:
+        pass
+    # 按标题关键词匹配
+    q = query.lower()
+    matches = [c for c in chapters if q in c.get("chapterTitle", "").lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        titles = [c.get("chapterTitle", "") for c in matches]
+        print(f"找到多个匹配章节：{titles}")
+        print("请使用更精确的章节名或编号。")
+        sys.exit(1)
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="从微信读书英文书籍提取生词并用 Claude 翻译"
+        description="从微信读书英文书籍提取生词并用 Claude 翻译",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  # 交互式选择
+  python weread_vocab.py
+
+  # 直接指定书名（模糊匹配）和章节
+  python weread_vocab.py --book "Atomic Habits" --chapter 3
+  python weread_vocab.py --book "Sapiens" --chapter "The Cognitive Revolution"
+
+  # 只列出书架/章节，不生成词汇表
+  python weread_vocab.py --list-books
+  python weread_vocab.py --book "Atomic Habits" --list-chapters
+""",
     )
-    parser.add_argument("--all-books", action="store_true", help="显示所有书籍（含中文书）")
+    parser.add_argument("--book", "-b", help="书名关键词（模糊匹配，省略则交互选择）")
+    parser.add_argument(
+        "--chapter", "-c",
+        help="章节编号（如 3）或章节标题关键词（省略则交互选择）",
+    )
+    parser.add_argument("--list-books", action="store_true", help="列出所有书籍后退出")
+    parser.add_argument("--list-chapters", action="store_true", help="列出所选书籍的所有章节后退出")
+    parser.add_argument("--all-books", action="store_true", help="不过滤语言，显示所有书籍")
     parser.add_argument("--max-words", type=int, default=MAX_VOCAB_WORDS, help="最多提取生词数量")
     parser.add_argument("--output", "-o", help="输出文件路径（默认自动命名）")
     args = parser.parse_args()
@@ -295,25 +358,41 @@ def main():
         die("书架为空，或 Cookie 无法访问书架数据。")
 
     if not args.all_books:
-        english_books = [b for b in books if is_english_book(b)]
-        if not english_books:
-            print("未检测到英文书籍，显示全部书架（也可加 --all-books 参数）")
-            english_books = books
+        pool = [b for b in books if is_english_book(b)] or books
     else:
-        english_books = books
-
-    print(f"\n找到 {len(english_books)} 本{'英文' if not args.all_books else ''}书籍：\n")
+        pool = books
 
     def book_label(b: dict) -> str:
         info = b.get("bookInfo", {})
         return f"{info.get('title', '?')}  ——  {info.get('author', '')}"
 
-    book_idx = select_from_list(english_books, book_label, "请选择书籍")
-    selected_book = english_books[book_idx]
-    book_info = selected_book.get("bookInfo", {})
+    # --list-books：只打印书架
+    if args.list_books:
+        print(f"\n书架（共 {len(pool)} 本）：\n")
+        for i, b in enumerate(pool):
+            print(f"  [{i + 1:3d}] {book_label(b)}")
+        return
+
+    # 选书
+    if args.book:
+        selected_book = find_book(pool, args.book)
+        if not selected_book:
+            # 尝试在全部书架里找
+            selected_book = find_book(books, args.book)
+        if not selected_book:
+            die(f"书架中未找到《{args.book}》，请用 --list-books 查看完整列表。")
+        book_info = selected_book.get("bookInfo", {})
+        book_title = book_info.get("title", "未知书名")
+        print(f"\n已匹配书籍：《{book_title}》")
+    else:
+        print(f"\n找到 {len(pool)} 本书籍：\n")
+        book_idx = select_from_list(pool, book_label, "请选择书籍")
+        selected_book = pool[book_idx]
+        book_info = selected_book.get("bookInfo", {})
+        book_title = book_info.get("title", "未知书名")
+        print(f"\n已选择：《{book_title}》")
+
     book_id = book_info.get("bookId", "")
-    book_title = book_info.get("title", "未知书名")
-    print(f"\n已选择：《{book_title}》")
 
     # ── 2. 获取章节列表 ───────────────────────────────────────
     print("正在获取章节列表...")
@@ -321,20 +400,31 @@ def main():
     if not chapters:
         die("获取章节失败，该书可能不支持网页阅读或章节信息不可用。")
 
-    display_chapters = chapters[:50]
-    if len(chapters) > 50:
-        print(f"（共 {len(chapters)} 章，仅显示前 50 章）\n")
-    else:
-        print(f"\n共 {len(chapters)} 章：\n")
-
     def chapter_label(c: dict) -> str:
         return c.get("chapterTitle", f"Chapter {c.get('chapterUid', '?')}")
 
-    ch_idx = select_from_list(display_chapters, chapter_label, "请选择章节")
-    selected_chapter = display_chapters[ch_idx]
+    # --list-chapters：只打印章节列表
+    if args.list_chapters:
+        print(f"\n《{book_title}》章节列表（共 {len(chapters)} 章）：\n")
+        for i, c in enumerate(chapters):
+            print(f"  [{i + 1:3d}] {chapter_label(c)}")
+        return
+
+    # 选章节
+    if args.chapter:
+        selected_chapter = find_chapter(chapters, args.chapter)
+        if not selected_chapter:
+            die(f'未找到章节 "{args.chapter}"，请用 --list-chapters 查看完整列表。')
+        chapter_title = chapter_label(selected_chapter)
+        print(f"已匹配章节：{chapter_title}")
+    else:
+        print(f"\n共 {len(chapters)} 章：\n")
+        ch_idx = select_from_list(chapters[:50], chapter_label, "请选择章节")
+        selected_chapter = chapters[ch_idx]
+        chapter_title = chapter_label(selected_chapter)
+        print(f"\n已选择章节：{chapter_title}")
+
     chapter_uid = selected_chapter.get("chapterUid")
-    chapter_title = selected_chapter.get("chapterTitle", f"Chapter {ch_idx + 1}")
-    print(f"\n已选择章节：{chapter_title}")
 
     # ── 3. 获取章节内容 ───────────────────────────────────────
     print("正在获取章节内容...")
