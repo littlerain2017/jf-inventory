@@ -245,6 +245,133 @@ def extract_vocabulary_with_claude(
     return message.content[0].text
 
 
+# ── Notion 集成 ───────────────────────────────────────────────────────────────
+
+def _parse_inline(text: str) -> list[dict]:
+    """将行内 markdown 格式（**bold** `code` *italic*）转为 Notion rich_text。"""
+    result = []
+    pattern = re.compile(r'\*\*(.+?)\*\*|`(.+?)`|\*(.+?)\*|([^*`]+)', re.DOTALL)
+    for m in pattern.finditer(text):
+        if m.group(1):
+            result.append({"type": "text", "text": {"content": m.group(1)},
+                           "annotations": {"bold": True}})
+        elif m.group(2):
+            result.append({"type": "text", "text": {"content": m.group(2)},
+                           "annotations": {"code": True}})
+        elif m.group(3):
+            result.append({"type": "text", "text": {"content": m.group(3)},
+                           "annotations": {"italic": True}})
+        elif m.group(4):
+            result.append({"type": "text", "text": {"content": m.group(4)}})
+    return result or [{"type": "text", "text": {"content": text}}]
+
+
+def _blk(kind: str, rich_text: list) -> dict:
+    return {"object": "block", "type": kind, kind: {"rich_text": rich_text}}
+
+
+def markdown_to_notion_blocks(md: str) -> list[dict]:
+    """将 markdown 字符串转换为 Notion block 列表。"""
+    blocks: list[dict] = []
+    lines = md.split("\n")
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        s = raw.rstrip()
+
+        if s.startswith("### "):
+            blocks.append(_blk("heading_3", _parse_inline(s[4:].strip("`").strip())))
+        elif s.startswith("## "):
+            blocks.append(_blk("heading_2", _parse_inline(s[3:])))
+        elif s.startswith("# "):
+            blocks.append(_blk("heading_1", _parse_inline(s[2:])))
+        elif s == "---":
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+        elif s.startswith("> "):
+            blocks.append(_blk("quote", _parse_inline(s[2:])))
+        elif s.startswith("- "):
+            blocks.append(_blk("bulleted_list_item", _parse_inline(s[2:])))
+        elif s.startswith("|") and i + 1 < len(lines) and re.match(r"\|[-| :]+\|", lines[i + 1]):
+            # 解析 markdown 表格
+            headers = [c.strip() for c in s.split("|")[1:-1]]
+            col_n = len(headers)
+            i += 2  # 跳过分隔行
+            rows: list[list[str]] = [headers]
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                row = [c.strip() for c in lines[i].split("|")[1:-1]]
+                rows.append((row + [""] * col_n)[:col_n])
+                i += 1
+            blocks.append({
+                "object": "block", "type": "table",
+                "table": {
+                    "table_width": col_n,
+                    "has_column_header": True,
+                    "has_row_header": False,
+                    "children": [
+                        {"object": "block", "type": "table_row",
+                         "table_row": {"cells": [[{"type": "text", "text": {"content": c}}]
+                                                  for c in row]}}
+                        for row in rows
+                    ],
+                },
+            })
+            continue
+        elif s.strip():
+            # 普通段落，Notion 单块上限 2000 字符
+            chunk = s
+            while chunk:
+                blocks.append(_blk("paragraph", _parse_inline(chunk[:2000])))
+                chunk = chunk[2000:]
+        i += 1
+    return blocks
+
+
+def send_to_notion(title: str, md_content: str) -> str:
+    """将 markdown 内容创建为 Notion 页面，返回页面 URL。"""
+    try:
+        from notion_client import Client
+    except ImportError:
+        die("请先安装 notion-client：pip install -r requirements.txt")
+
+    api_key = os.getenv("NOTION_API_KEY", "").strip()
+    parent_id = os.getenv("NOTION_PAGE_ID", "").strip()
+
+    if not api_key:
+        die(
+            "未设置 NOTION_API_KEY。\n"
+            "请到 https://www.notion.so/my-integrations 创建 Integration，\n"
+            "将生成的 secret_xxx 写入 tools/.env：\n"
+            "  NOTION_API_KEY=secret_xxx\n"
+            "并在 Notion 目标页面右上角 ··· → Connections 中添加该 Integration。"
+        )
+    if not parent_id:
+        die(
+            "未设置 NOTION_PAGE_ID。\n"
+            "打开 Notion 目标页面，URL 末尾的 32 位字符串即为页面 ID，\n"
+            "写入 tools/.env：\n"
+            "  NOTION_PAGE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        )
+
+    notion = Client(auth=api_key)
+    blocks = markdown_to_notion_blocks(md_content)
+
+    # Notion API 单次最多 100 个 block
+    first_batch, rest = blocks[:100], blocks[100:]
+    page = notion.pages.create(
+        parent={"page_id": parent_id},
+        properties={"title": {"title": [{"type": "text", "text": {"content": title}}]}},
+        children=first_batch,
+    )
+    page_id = page["id"]
+
+    for start in range(0, len(rest), 100):
+        notion.blocks.children.append(page_id, children=rest[start:start + 100])
+
+    return page.get("url") or f"https://notion.so/{page_id.replace('-', '')}"
+
+
+# ── 列表交互 ──────────────────────────────────────────────────────────────────
+
 def select_from_list(items: list, label_fn, prompt: str) -> int:
     for i, item in enumerate(items):
         print(f"  [{i + 1:3d}] {label_fn(item)}")
@@ -343,6 +470,7 @@ def main():
     parser.add_argument("--all-books", action="store_true", help="不过滤语言，显示所有书籍")
     parser.add_argument("--max-words", type=int, default=MAX_VOCAB_WORDS, help="最多提取生词数量")
     parser.add_argument("--output", "-o", help="输出文件路径（默认自动命名）")
+    parser.add_argument("--notion", action="store_true", help="同时发送生词表到 Notion（需设置 NOTION_API_KEY 和 NOTION_PAGE_ID）")
     args = parser.parse_args()
 
     print("=" * 55)
@@ -445,6 +573,13 @@ def main():
         f.write(result)
 
     print(f"\n生词表已保存至：{output_path}")
+
+    if args.notion:
+        notion_title = f"《{book_title}》{chapter_title} 生词表"
+        print(f"\n正在发送到 Notion：{notion_title} ...")
+        url = send_to_notion(notion_title, result)
+        print(f"已创建 Notion 页面：{url}")
+
     print("\n" + "=" * 55)
     print(result)
 
